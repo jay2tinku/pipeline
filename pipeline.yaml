@@ -1,0 +1,220 @@
+# PersistentVolumeClaim for storing the cloned repository
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: repo-workspace
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+# PersistentVolumeClaim for storing HTML files
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: html-home
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+# Task to cleanup old repository
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: cleanup-repo
+spec:
+  workspaces:
+    - name: repo-workspace
+  steps:
+    - name: cleanup
+      image: 'alpine:latest'
+      script: |
+        echo "Cleaning up old repository contents..."
+        rm -rf /workspace/repo-workspace/*
+        ls /workspace/repo-workspace
+---
+# Task to clone the repository to PVC
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: clone-repo
+spec:
+  workspaces:
+    - name: repo-workspace
+  params:
+    - name: repository-url
+      type: string
+  steps:
+    - name: clone
+      image: 'alpine/git:latest'
+      script: |
+        TEMP_DIR=/workspace/temp-repo
+        mkdir -p $TEMP_DIR
+        echo "Cloning repository: $(params.repository-url)"
+        git clone $(params.repository-url) $TEMP_DIR
+        if [ $? -ne 0 ]; then
+          echo "Failed to clone repository. Check URL and credentials."
+          exit 1
+        fi
+        rm -rf /workspace/repo-workspace/*
+        cp -r $TEMP_DIR/* /workspace/repo-workspace/
+        ls /workspace/repo-workspace
+      volumeMounts:
+        - name: git-credentials
+          mountPath: /root/.git-credentials
+          subPath: .git-credentials
+      env:
+        - name: GIT_ASKPASS
+          value: /bin/true
+  volumes:
+    - name: git-credentials
+      secret:
+        secretName: git-credentials
+---
+# Task to deploy the application
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: deploy-app
+spec:
+  params:
+    - name: image-name
+      type: string
+    - name: deployment-name
+      type: string
+  workspaces:
+    - name: repo-workspace
+  steps:
+    - name: deploy
+      image: 'registry.redhat.io/openshift4/ose-cli:latest'
+      script: |
+        # Checking if deployment exists, create if it doesn't
+        if oc get deployment $(params.deployment-name) >/dev/null 2>&1; then
+          echo "Deployment $(params.deployment-name) already exists, updating."
+          oc rollout restart deployment/$(params.deployment-name)
+        else
+          echo "Creating deployment $(params.deployment-name)."
+          oc new-app $(params.image-name) --name=$(params.deployment-name)
+        fi
+        # Check if service exists, create if it doesn't
+        if oc get svc $(params.deployment-name) >/dev/null 2>&1; then
+          echo "Service $(params.deployment-name) already exists, skipping creation."
+        else
+          echo "Creating service for $(params.deployment-name)."
+          oc expose deployment $(params.deployment-name)
+        fi
+        # Check if route exists, create if it doesn't
+        if oc get route $(params.deployment-name) >/dev/null 2>&1; then
+          echo "Route $(params.deployment-name) already exists, skipping creation."
+        else
+          echo "Creating route $(params.deployment-name)."
+          oc expose svc/$(params.deployment-name)
+        fi
+---
+# Task to create and patch ConfigMap
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: manage-configmap
+spec:
+  params:
+    - name: deployment-name
+      type: string
+    - name: configmap-name
+      type: string
+  workspaces:
+    - name: repo-workspace
+  steps:
+    - name: manage-configmap
+      image: 'registry.redhat.io/openshift4/ose-cli:latest'
+      script: |
+        # Create or update ConfigMap with index.html
+        if oc get configmap $(params.configmap-name) >/dev/null 2>&1; then
+          echo "ConfigMap $(params.configmap-name) already exists, updating."
+          oc create configmap $(params.configmap-name) --from-file=index.html=/workspace/repo-workspace/index.html --dry-run=client -o yaml | oc apply -f -
+        else
+          echo "Creating ConfigMap $(params.configmap-name) with index.html"
+          oc create configmap $(params.configmap-name) --from-file=index.html=/workspace/repo-workspace/index.html
+        fi
+        # Patch deployment with the ConfigMap
+        if oc get deployment $(params.deployment-name) >/dev/null 2>&1; then
+          echo "Deployment $(params.deployment-name) exists, patching with ConfigMap."
+          oc set volume deployment/$(params.deployment-name) --add --name=html-home --mount-path=/var/www/html --configmap-name=$(params.configmap-name) --overwrite
+        else
+          echo "Deployment $(params.deployment-name) does not exist. Please check deployment creation."
+        fi
+---
+# Pipeline definition
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: deploy-app-pipeline
+spec:
+  params:
+    - name: repository-url
+      type: string
+      description: "Repository URL to clone"
+    - name: image-name
+      type: string
+      description: "Image to use for deployment"
+      default: "registry.redhat.io/rhel8/httpd-24:1-335.1724231549"
+    - name: deployment-name
+      type: string
+      description: "Name of the deployment"
+    - name: configmap-name
+      type: string
+      description: "Name of the ConfigMap"
+    - name: pvc-name
+      type: string
+      description: "Name of the PVC to use for the repository"
+  workspaces:
+    - name: repo-workspace
+  tasks:
+    - name: cleanup-repo
+      taskRef:
+        name: cleanup-repo
+      workspaces:
+        - name: repo-workspace
+          workspace: repo-workspace
+    - name: clone-repo
+      taskRef:
+        name: clone-repo
+      params:
+        - name: repository-url
+          value: $(params.repository-url)
+      workspaces:
+        - name: repo-workspace
+          workspace: repo-workspace
+      runAfter:
+        - cleanup-repo
+    - name: deploy-app
+      taskRef:
+        name: deploy-app
+      params:
+        - name: image-name
+          value: $(params.image-name)
+        - name: deployment-name
+          value: $(params.deployment-name)
+      workspaces:
+        - name: repo-workspace
+          workspace: repo-workspace
+      runAfter:
+        - clone-repo
+    - name: manage-configmap
+      taskRef:
+        name: manage-configmap
+      params:
+        - name: deployment-name
+          value: $(params.deployment-name)
+        - name: configmap-name
+          value: $(params.configmap-name)
+      workspaces:
+        - name: repo-workspace
+          workspace: repo-workspace
+      runAfter:
+        - deploy-app
